@@ -1,0 +1,38 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Env files / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Next
+node_modules/
+.next/
+out/
+dist/
+coverage/
+.vercel/
+.turbo/
+
+# Logs
+*.log
+
+# Misc
+*.sqlite
+*.db
