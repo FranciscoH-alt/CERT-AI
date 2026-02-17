@@ -12,11 +12,12 @@ from routes.auth_routes import router as auth_router
 from routes.exam_routes import router as exam_router
 from routes.progress_routes import router as progress_router
 from routes.certification_routes import router as cert_router
+from routes.simulation_routes import router as sim_router
 
 app = FastAPI(
     title="CertAI API",
     description="Adaptive AI certification exam platform",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 # CORS configuration for Next.js frontend
@@ -33,9 +34,10 @@ app.include_router(auth_router)
 app.include_router(exam_router)
 app.include_router(progress_router)
 app.include_router(cert_router)
+app.include_router(sim_router)
 
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint for monitoring."""
-    return {"status": "healthy", "version": "1.0.0"}
+    return {"status": "healthy", "version": "2.0.0"}

@@ -14,18 +14,16 @@ from config import GEMINI_API_KEY, GEMINI_API_URL
 QUESTION_PROMPT_TEMPLATE = """You are generating a {cert_name} certification exam question.
 
 Constraints:
-• Domain: {domain}
-• Difficulty Rating: {difficulty} (1000=medium baseline, higher=harder)
-• 4 answer options
-• 1 correct answer
-• Scenario-based where appropriate
-• No ambiguous wording
-• Professional tone
-• Realistic Microsoft-style question
+- Domain: {domain}
+- Difficulty Rating: {difficulty} (1000=medium baseline, higher=harder)
+- 4 answer options, 1 correct answer
+- Scenario-based where appropriate
+- No ambiguous wording
+- Professional tone, realistic Microsoft-style question
 
 Return JSON ONLY in this exact format (no markdown, no code fences):
 
-{{"question": "The full question text here", "options": ["Option A text", "Option B text", "Option C text", "Option D text"], "correct_index": 0, "explanation": "Detailed explanation of why the correct answer is right and others are wrong", "domain": "{domain}"}}"""
+{{"scenario": "A brief scenario/context (1-3 sentences). Leave empty string if question is direct.", "question": "The actual question prompt", "options": ["Option A", "Option B", "Option C", "Option D"], "correct_index": 0, "explanation_correct": "Why the correct answer is right", "explanation_wrong": ["Why A is wrong or correct", "Why B is wrong or correct", "Why C is wrong or correct", "Why D is wrong or correct"], "concept_tag": "Primary concept being tested (e.g. DAX CALCULATE, Star Schema, RLS)", "domain": "{domain}"}}"""
 
 
 async def generate_question(
@@ -41,8 +39,9 @@ async def generate_question(
         cert_name: Full certification name for context.
 
     Returns:
-        Validated question dict with keys: question, options, correct_index,
-        explanation, domain. Returns None if generation or validation fails.
+        Validated question dict with keys: scenario, question, options, correct_index,
+        explanation_correct, explanation_wrong, concept_tag, domain.
+        Returns None if generation or validation fails.
     """
     prompt = QUESTION_PROMPT_TEMPLATE.format(
         cert_name=cert_name,
@@ -55,13 +54,13 @@ async def generate_question(
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.8,
-            "maxOutputTokens": 1024,
+            "maxOutputTokens": 8192,
             "topP": 0.95,
         },
     }
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 f"{GEMINI_API_URL}?key={GEMINI_API_KEY}",
                 json=payload,
@@ -71,7 +70,21 @@ async def generate_question(
             data = response.json()
 
         # Extract the generated text from Gemini's response structure
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        # Gemini 2.5+ models may return multiple parts (thought + text)
+        parts = data["candidates"][0]["content"]["parts"]
+        text = None
+        for part in parts:
+            if "text" in part and not part.get("thought"):
+                text = part["text"]
+        if text is None:
+            # Fallback: use the last part with text
+            for part in reversed(parts):
+                if "text" in part:
+                    text = part["text"]
+                    break
+        if text is None:
+            print(f"[Gemini] No text found in response parts: {parts}")
+            return None
 
         # Clean up response — strip markdown code fences if present
         text = text.strip()
@@ -98,13 +111,10 @@ def _validate_question(data: dict) -> dict:
 
     Raises ValueError if validation fails.
 
-    Checks:
-    - All required keys are present
-    - Exactly 4 options
-    - correct_index is 0-3
-    - All text fields are non-empty
+    Supports both new format (with scenario, explanation_correct, etc.)
+    and legacy format (with single explanation field).
     """
-    required_keys = {"question", "options", "correct_index", "explanation", "domain"}
+    required_keys = {"question", "options", "correct_index", "domain"}
     if not required_keys.issubset(data.keys()):
         missing = required_keys - data.keys()
         raise ValueError(f"Missing required keys: {missing}")
@@ -118,16 +128,28 @@ def _validate_question(data: dict) -> dict:
     if not data["question"].strip():
         raise ValueError("Question text is empty")
 
-    if not data["explanation"].strip():
-        raise ValueError("Explanation is empty")
-
     if any(not opt.strip() for opt in data["options"]):
         raise ValueError("One or more options are empty")
 
+    # Handle both new and legacy explanation formats
+    explanation_correct = data.get("explanation_correct", "")
+    explanation_wrong = data.get("explanation_wrong", [])
+    legacy_explanation = data.get("explanation", "")
+
+    if not explanation_correct and legacy_explanation:
+        explanation_correct = legacy_explanation
+
+    if not explanation_correct:
+        raise ValueError("Missing explanation")
+
     return {
+        "scenario": data.get("scenario", "").strip(),
         "question": data["question"].strip(),
         "options": [opt.strip() for opt in data["options"]],
         "correct_index": data["correct_index"],
-        "explanation": data["explanation"].strip(),
+        "explanation": explanation_correct.strip(),
+        "explanation_correct": explanation_correct.strip(),
+        "explanation_wrong": [e.strip() if isinstance(e, str) else "" for e in explanation_wrong],
+        "concept_tag": data.get("concept_tag", "").strip(),
         "domain": data["domain"].strip(),
     }

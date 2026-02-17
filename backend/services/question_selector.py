@@ -2,7 +2,7 @@
 
 This module implements the core question selection logic:
 1. Identify the user's weakest domain
-2. Target difficulty = user_skill ± 50
+2. Target difficulty = user_skill +/- 50
 3. Check for existing questions in the DB within that range
 4. If none found, generate a new question via Gemini AI
 """
@@ -66,7 +66,7 @@ async def select_next_question(
         if domain_id in user_skills:
             skill = user_skills[domain_id]["skill_rating"]
         else:
-            # Unattempted domain — prioritize it
+            # Unattempted domain -- prioritize it
             skill = ELO_DEFAULT_SKILL - 100  # slightly below default to prioritize
         if skill < weakest_skill:
             weakest_skill = skill
@@ -83,12 +83,11 @@ async def select_next_question(
         else ELO_DEFAULT_SKILL
     )
 
-    # Target difficulty: centered on user's skill ± range
+    # Target difficulty: centered on user's skill +/- range
     target_low = user_domain_skill - ELO_DIFFICULTY_RANGE
     target_high = user_domain_skill + ELO_DIFFICULTY_RANGE
 
     # Step 5: Try to find an existing unanswered question in range
-    # Get IDs of questions user has already answered
     answered_res = (
         db.table("user_responses")
         .select("question_id")
@@ -112,18 +111,20 @@ async def select_next_question(
     available = [q for q in query.data if q["id"] not in answered_ids]
 
     if available:
-        # Serve from cache — pick the one closest to user's skill level
+        # Serve from cache -- pick the one closest to user's skill level
         best = min(available, key=lambda q: abs(q["difficulty_estimate"] - user_domain_skill))
         return {
             "question_id": best["id"],
+            "scenario_text": best.get("scenario_text") or "",
             "question_text": best["question_text"],
             "options": best["options"],
             "domain": weakest_domain["name"],
             "difficulty": best["difficulty_estimate"],
+            "concept_tag": best.get("concept_tag") or "",
             "from_cache": True,
         }
 
-    # Step 6: No cached question available — generate new one via Gemini
+    # Step 6: No cached question available -- generate new one via Gemini
     generated = await generate_question(
         domain=weakest_domain["name"],
         difficulty=user_domain_skill,
@@ -134,26 +135,34 @@ async def select_next_question(
         return None
 
     # Store the generated question in the database for future use
-    insert_res = (
-        db.table("questions")
-        .insert({
-            "domain_id": domain_id,
-            "certification_id": certification_id,
-            "question_text": generated["question"],
-            "options": generated["options"],
-            "correct_index": generated["correct_index"],
-            "explanation": generated["explanation"],
-            "difficulty_estimate": user_domain_skill,  # Start at user's level
-        })
-        .execute()
-    )
+    insert_data = {
+        "domain_id": domain_id,
+        "certification_id": certification_id,
+        "question_text": generated["question"],
+        "options": generated["options"],
+        "correct_index": generated["correct_index"],
+        "explanation": generated.get("explanation_correct") or generated.get("explanation", ""),
+        "difficulty_estimate": user_domain_skill,
+        "scenario_text": generated.get("scenario", ""),
+        "concept_tag": generated.get("concept_tag", ""),
+    }
+
+    try:
+        insert_res = db.table("questions").insert(insert_data).execute()
+    except Exception:
+        # If scenario_text/concept_tag columns don't exist yet (pre-migration), retry without them
+        insert_data.pop("scenario_text", None)
+        insert_data.pop("concept_tag", None)
+        insert_res = db.table("questions").insert(insert_data).execute()
 
     new_question = insert_res.data[0]
     return {
         "question_id": new_question["id"],
+        "scenario_text": new_question.get("scenario_text") or "",
         "question_text": new_question["question_text"],
         "options": new_question["options"],
         "domain": weakest_domain["name"],
         "difficulty": new_question["difficulty_estimate"],
+        "concept_tag": new_question.get("concept_tag") or "",
         "from_cache": False,
     }

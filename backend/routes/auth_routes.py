@@ -1,16 +1,41 @@
-"""User profile routes.
+"""User profile and auth routes.
 
-These endpoints handle user profile retrieval and updates.
+These endpoints handle user profile retrieval, updates, and auth helpers.
 Authentication is handled client-side by Supabase Auth — the backend
 validates the JWT and uses the user_id from the token.
 """
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from services.auth import get_current_user_id
 from services.supabase_client import get_supabase
 from models.schemas import UserProfile, UpdateUserProfile
+from config import SUPABASE_URL, SUPABASE_SERVICE_KEY
+import httpx
 
 router = APIRouter(prefix="/user", tags=["user"])
+
+
+class ConfirmUserRequest(BaseModel):
+    user_id: str
+
+
+@router.post("/confirm")
+async def confirm_user(req: ConfirmUserRequest):
+    """Auto-confirm a user's email using the Supabase Admin API."""
+    async with httpx.AsyncClient() as client:
+        response = await client.put(
+            f"{SUPABASE_URL}/auth/v1/admin/users/{req.user_id}",
+            json={"email_confirm": True},
+            headers={
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "Content-Type": "application/json",
+            },
+        )
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail="Failed to confirm user")
+    return {"confirmed": True}
 
 
 @router.get("/profile", response_model=UserProfile)

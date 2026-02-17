@@ -4,13 +4,21 @@ These endpoints power the adaptive exam system:
 - Start/end exam sessions
 - Generate adaptive questions
 - Submit answers and update ELO ratings
+- Review queue management
 """
 
+from datetime import date, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from services.auth import get_current_user_id
 from services.supabase_client import get_supabase
 from services.question_selector import select_next_question
-from services.elo import update_ratings, calculate_pass_probability
+from services.elo import update_ratings, get_difficulty_label
+from services.review_queue import (
+    add_to_review_queue,
+    auto_queue_weak_concept,
+    get_due_reviews,
+    get_concept_mastery,
+)
 from models.schemas import (
     GenerateQuestionRequest,
     GeneratedQuestion,
@@ -18,6 +26,7 @@ from models.schemas import (
     SubmitAnswerResponse,
     StartSessionRequest,
     SessionResponse,
+    AddReviewRequest,
 )
 
 router = APIRouter(prefix="/exam", tags=["exam"])
@@ -31,7 +40,6 @@ async def start_session(
     """Start a new exam session for tracking progress within a sitting."""
     db = get_supabase()
 
-    # Lookup the certification
     cert = (
         db.table("certifications")
         .select("id")
@@ -43,10 +51,8 @@ async def start_session(
     if not cert.data:
         raise HTTPException(status_code=404, detail="Certification not found or not active")
 
-    # Get current user skill for snapshot
     user = db.table("users").select("global_skill").eq("id", user_id).single().execute()
 
-    # Create session
     session = (
         db.table("exam_sessions")
         .insert({
@@ -69,14 +75,9 @@ async def generate_question_endpoint(
     req: GenerateQuestionRequest,
     user_id: str = Depends(get_current_user_id),
 ):
-    """Generate the next adaptive question for the user.
-
-    Uses the question selector to find or generate an appropriately
-    difficult question targeting the user's weakest domain.
-    """
+    """Generate the next adaptive question for the user."""
     db = get_supabase()
 
-    # Lookup the certification
     cert = (
         db.table("certifications")
         .select("id, title")
@@ -88,7 +89,6 @@ async def generate_question_endpoint(
     if not cert.data:
         raise HTTPException(status_code=404, detail="Certification not found or not active")
 
-    # Use adaptive question selector
     question = await select_next_question(
         user_id=user_id,
         certification_id=cert.data["id"],
@@ -103,10 +103,12 @@ async def generate_question_endpoint(
 
     return GeneratedQuestion(
         question_id=question["question_id"],
+        scenario_text=question.get("scenario_text", ""),
         question_text=question["question_text"],
         options=question["options"],
         domain=question["domain"],
         difficulty=question["difficulty"],
+        concept_tag=question.get("concept_tag", ""),
         session_id=req.session_id,
     )
 
@@ -116,15 +118,7 @@ async def submit_answer(
     req: SubmitAnswerRequest,
     user_id: str = Depends(get_current_user_id),
 ):
-    """Submit an answer and update ELO ratings for user and question.
-
-    This is the core adaptive loop:
-    1. Check if the answer is correct
-    2. Update user's global skill via ELO
-    3. Update user's domain-specific skill via ELO
-    4. Update question difficulty via ELO
-    5. Record the response
-    """
+    """Submit an answer and update ELO ratings for user and question."""
     db = get_supabase()
 
     # Fetch the question
@@ -142,7 +136,14 @@ async def submit_answer(
     is_correct = req.selected_index == q["correct_index"]
 
     # Fetch current user skill
-    user = db.table("users").select("global_skill").eq("id", user_id).single().execute()
+    try:
+        user = db.table("users").select("global_skill, current_streak, longest_streak, last_active_date").eq("id", user_id).single().execute()
+    except Exception:
+        # Fallback if v2 columns don't exist yet
+        user = db.table("users").select("global_skill").eq("id", user_id).single().execute()
+        user.data["current_streak"] = 0
+        user.data["longest_streak"] = 0
+        user.data["last_active_date"] = None
     user_skill_before = user.data["global_skill"]
 
     # ============================================
@@ -167,7 +168,6 @@ async def submit_answer(
     )
 
     if domain_skill_res.data:
-        # Update existing domain skill
         ds = domain_skill_res.data[0]
         new_domain_skill, _ = update_ratings(
             user_skill=ds["skill_rating"],
@@ -180,7 +180,6 @@ async def submit_answer(
             "questions_correct": ds["questions_correct"] + (1 if is_correct else 0),
         }).eq("id", ds["id"]).execute()
     else:
-        # Create new domain skill entry
         new_domain_skill, _ = update_ratings(
             user_skill=1000.0,
             question_difficulty=q["difficulty_estimate"],
@@ -233,14 +232,80 @@ async def submit_answer(
                 "skill_after": new_user_skill,
             }).eq("id", req.session_id).execute()
 
+    # ============================================
+    # DAILY ACTIVITY & STREAK TRACKING
+    # ============================================
+    today = date.today().isoformat()
+    try:
+        existing_activity = (
+            db.table("daily_activity")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("activity_date", today)
+            .execute()
+        )
+        if existing_activity.data:
+            da = existing_activity.data[0]
+            db.table("daily_activity").update({
+                "questions_answered": da["questions_answered"] + 1,
+                "questions_correct": da["questions_correct"] + (1 if is_correct else 0),
+                "time_spent_seconds": da["time_spent_seconds"] + (req.time_spent_seconds or 0),
+            }).eq("id", da["id"]).execute()
+        else:
+            db.table("daily_activity").insert({
+                "user_id": user_id,
+                "activity_date": today,
+                "questions_answered": 1,
+                "questions_correct": 1 if is_correct else 0,
+                "time_spent_seconds": req.time_spent_seconds or 0,
+            }).execute()
+
+        # Update streak
+        u = user.data
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        last_active = str(u.get("last_active_date") or "") if u.get("last_active_date") else ""
+        if last_active == yesterday:
+            new_streak = (u.get("current_streak") or 0) + 1
+        elif last_active == today:
+            new_streak = u.get("current_streak") or 1
+        else:
+            new_streak = 1
+
+        db.table("users").update({
+            "current_streak": new_streak,
+            "longest_streak": max(new_streak, u.get("longest_streak") or 0),
+            "last_active_date": today,
+        }).eq("id", user_id).execute()
+    except Exception:
+        pass  # Non-critical: don't fail answer submission over streak tracking
+
+    # ============================================
+    # AUTO-QUEUE FOR REVIEW (incorrect answers)
+    # ============================================
+    auto_queued = False
+    if not is_correct:
+        try:
+            auto_queued = await auto_queue_weak_concept(
+                user_id=user_id,
+                question_id=q["id"],
+                concept_tag=q.get("concept_tag") or "",
+            )
+        except Exception:
+            pass  # Non-critical
+
     return SubmitAnswerResponse(
         is_correct=is_correct,
         correct_index=q["correct_index"],
-        explanation=q["explanation"],
+        explanation=q.get("explanation") or "",
+        why_correct=q.get("explanation") or "",
+        why_others_wrong=[],
+        concept_tag=q.get("concept_tag") or "",
+        difficulty_label=get_difficulty_label(q["difficulty_estimate"]),
         skill_before=user_skill_before,
         skill_after=new_user_skill,
         domain=q["domains"]["name"] if q.get("domains") else "",
         domain_skill_after=new_domain_skill,
+        auto_queued_for_review=auto_queued,
     )
 
 
@@ -261,3 +326,44 @@ async def end_session(
     }).eq("id", session_id).eq("user_id", user_id).execute()
 
     return {"status": "session_ended"}
+
+
+# ============================================
+# Review Queue Endpoints
+# ============================================
+
+@router.post("/review/add")
+async def add_review(
+    req: AddReviewRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Manually add a question to the review queue."""
+    try:
+        db = get_supabase()
+        q = db.table("questions").select("concept_tag").eq("id", req.question_id).single().execute()
+        concept_tag = q.data.get("concept_tag") or "" if q.data else ""
+        added = await add_to_review_queue(user_id, req.question_id, concept_tag, source="manual")
+        return {"added": added}
+    except Exception:
+        # review_queue table may not exist yet (pre-migration)
+        return {"added": False, "message": "Review queue not available. Run database migration 002_v2_features.sql."}
+
+
+@router.get("/review/due")
+async def get_reviews_due(user_id: str = Depends(get_current_user_id)):
+    """Get questions due for review."""
+    try:
+        reviews = await get_due_reviews(user_id)
+        return {"reviews": reviews, "count": len(reviews)}
+    except Exception:
+        return {"reviews": [], "count": 0}
+
+
+@router.get("/review/concepts")
+async def get_concepts(user_id: str = Depends(get_current_user_id)):
+    """Get mastery scores per concept."""
+    try:
+        concepts = await get_concept_mastery(user_id)
+        return {"concepts": concepts}
+    except Exception:
+        return {"concepts": []}
