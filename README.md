@@ -179,7 +179,3 @@ cd backend
 # Deploy with your preferred platform
 # Ensure environment variables are configured
 ```
-
-## License
-
-MIT
